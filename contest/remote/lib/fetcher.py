@@ -154,3 +154,10 @@ class Fetcher:
     def run(self):
         while self.life.next_poll():
             self._run_once()
+
+
+def namify(what):
+    name = re.sub(r'[^0-9a-zA-Z]+', '-', what)
+    if name[-1] == '-':
+        name = name[:-1]
+    return name

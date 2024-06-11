@@ -8,7 +8,7 @@ import os
 import subprocess
 
 from core import NipaLifetime
-from lib import Fetcher
+from lib import Fetcher, namify
 
 
 """
@@ -94,16 +94,17 @@ def summary_flat(expected, got, sub_path=""):
     bad_tests = []
     for case in got["test_cases"]:
         code = str_to_code[case["status"]]
+        name = namify(case["name"])
 
-        exp = expected.get(got["name"], {}).get(case["name"])
+        exp = expected.get(got["name"], {}).get(name)
         if exp and exp == code:
             continue
 
         overall_code = max(code, overall_code)
-        results.append({'test': sub_path + case["name"],
+        results.append({'test': sub_path + name,
                         'result': code_to_str[code]})
         if code:
-            bad_tests.append(f"{got['name']} {case['name']} {case['status']}")
+            bad_tests.append(f"{got['name']} {name} {case['status']}")
 
     for sub_group in got["sub_groups"]:
         ov, bt, res = summary_flat(expected, sub_group, sub_path + sub_group["name"])

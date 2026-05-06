@@ -39,7 +39,7 @@ echo >&2 Running nipa in Docker...
 docker run $DOCKER_FLAGS --rm --user=nipa \
        --read-only \
        -v $PWD/nipa-run/tmp:/tmp \
-       -v $PWD/..:/nipa:ro \
+       -v $PWD/../..:/nipa:ro \
        -v $PWD/nipa-run/patatt:/home/nipa/.local/share/patatt \
        -v $PWD/nipa-run/patatt:/root/.local/share/patatt \
        -v $PWD/nipa.config:/nipa.config:ro \

@@ -2,3 +2,4 @@
 cd "$(dirname "${0}")"
 ./base/build.sh
 ./build/build.sh
+./selftests/build.sh

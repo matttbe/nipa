@@ -20,6 +20,11 @@ ARGS=(
 )
 test -t 1 && ARGS+=("-t")
 
+if [ "${1}" = "--pull" ]; then
+	ARGS+=(--pull always)
+	shift
+fi
+
 DOCKER_IMG="${INPUT_PREFIX}/nipa-${DIR_NAME}:${INPUT_TAG}"
 echo "Using ${DOCKER_IMG} image" >&2
 

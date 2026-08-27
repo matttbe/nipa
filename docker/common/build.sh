@@ -20,12 +20,7 @@ if [ "${INPUT_PUSH}" = 1 ]; then
 	ARGS+=(--push)
 fi
 
-if [ "${IMG}" != "nipa-base" ]; then
-	ARGS+=(--cache-from "type=registry,ref=nipa-base")
-fi
-
 docker buildx build \
-	--cache-to type=inline \
 	-f "Dockerfile" --load \
 	-t "${IMG}" "${ARGS[@]}" "${@}" .
 docker tag "${IMG}" "${PUB_IMG}"

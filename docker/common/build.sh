@@ -22,6 +22,7 @@ if [ "${INPUT_PUSH}" = 1 ]; then
 fi
 
 docker buildx build --build-arg=BASE_TAG="${INPUT_TAG}" \
+	--build-arg=BUILDKIT_INLINE_CACHE=true \
 	-f "Dockerfile" --load \
 	-t "${LOC_IMG}" "${ARGS[@]}" "${@}" .
 docker tag "${LOC_IMG}" "${PUB_IMG}"

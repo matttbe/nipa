@@ -33,8 +33,12 @@ def combine_infos(config):
         with open(path, "r") as fp:
             infos.update(json.load(fp))
 
-    with open(config.get("output", "info"), 'w') as fp:
+    # atomic write needed
+    path = config.get("output", "info")
+    tmp = path + '.new'
+    with open(tmp, 'w') as fp:
         json.dump(infos, fp)
+    os.rename(tmp, path)
 
 
 def main() -> None:

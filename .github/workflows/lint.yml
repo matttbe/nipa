@@ -1,10 +1,18 @@
 # Run linters on code in repo to avoid common issues:
 # * YAPF for Python scripts
 name: Lint checks
-on: [push, pull_request]
+on:
+  push:
+    branches:
+      - 'main'
+    paths:
+      - '**.py'
+  pull_request:
+    paths:
+      - '**.py'
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v6
     - uses: cclauss/Find-Python-syntax-errors-action@master

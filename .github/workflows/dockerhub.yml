@@ -43,42 +43,9 @@ jobs:
         name: Checkout
         uses: actions/checkout@v6
       -
-        name: Build and push base docker image
-        uses: docker/build-push-action@v7
-        with:
-          push: ${{ github.event_name == 'push' }}
-          load: true
-          platforms: linux/amd64  # linux/arm64
-          file: ./docker/base/Dockerfile
-          context: ./docker/base/
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/nipa-base:latest
-          cache-to: type=inline
-          tags: |
-            nipa-base
-            ghcr.io/${{ github.repository_owner }}/nipa-base:latest
-      -
-        name: Build and push build docker image
-        uses: docker/build-push-action@v7
-        with:
-          push: ${{ github.event_name == 'push' }}
-          platforms: linux/amd64  # linux/arm64
-          file: ./docker/build/Dockerfile
-          context: ./docker/build/
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/nipa-build:latest
-          cache-to: type=inline
-          tags: |
-            nipa-build
-            ghcr.io/${{ github.repository_owner }}/nipa-build:latest
-      -
-        name: Build and push selftests docker image
-        uses: docker/build-push-action@v7
-        with:
-          push: ${{ github.event_name == 'push' }}
-          platforms: linux/amd64  # linux/arm64
-          file: ./docker/selftests/Dockerfile
-          context: ./docker/selftests/
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/nipa-selftests:latest
-          cache-to: type=inline
-          tags: |
-            nipa-selftests
-            ghcr.io/${{ github.repository_owner }}/nipa-selftests:latest
+        name: Build and push docker images
+        run: |
+          INPUT_PUSH=${{ github.event_name == 'push' && '1' || '0' }} \
+            INPUT_PREFIX="ghcr.io/${{ github.repository_owner }}" \
+            INPUT_TAG="latest" \
+            ./docker/build.sh

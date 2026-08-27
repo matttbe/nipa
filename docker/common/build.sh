@@ -10,8 +10,7 @@ cd "$(dirname "${0}")"
 DIR_NAME="$(basename "${PWD}")"
 ARGS=()
 IMG="nipa-${DIR_NAME}"
-LOC_IMG="${IMG}:${INPUT_TAG}"
-PUB_IMG="${INPUT_PREFIX}/${LOC_IMG}"
+PUB_IMG="${INPUT_PREFIX}/${IMG}:${INPUT_TAG}"
 
 if [[ ${-} =~ "x" ]]; then
 	ARGS+=(--progress plain)
@@ -21,9 +20,13 @@ if [ "${INPUT_PUSH}" = 1 ]; then
 	ARGS+=(--push)
 fi
 
-docker buildx build --build-arg=BASE_TAG="${INPUT_TAG}" \
-	--build-arg=BUILDKIT_INLINE_CACHE=true \
+if [ "${IMG}" != "nipa-base" ]; then
+	ARGS+=(--cache-from "type=registry,ref=nipa-base")
+fi
+
+docker buildx build \
+	--cache-to type=inline \
 	-f "Dockerfile" --load \
-	-t "${LOC_IMG}" "${ARGS[@]}" "${@}" .
-docker tag "${LOC_IMG}" "${PUB_IMG}"
+	-t "${IMG}" "${ARGS[@]}" "${@}" .
+docker tag "${IMG}" "${PUB_IMG}"
 docker system prune --filter "label=name=${IMG}" -f >&2

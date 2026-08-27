@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0
-ARG BASE_PREFIX=""
-ARG BASE_TAG="latest"
-FROM ${BASE_PREFIX}nipa-base:${BASE_TAG}
+FROM nipa-base
 
 LABEL name=nipa-build
 

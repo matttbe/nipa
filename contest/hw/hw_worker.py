@@ -543,11 +543,15 @@ def main():
         else:
             print(f"Warning: could not collect device info for {netif}")
 
-    crashed = run_tests(test_dir, results_dir, timeout=_test_timeout(env))
+    outcome = run_tests(test_dir, results_dir, timeout=_test_timeout(env))
 
     print(f"Completed, results in {results_dir}")
-    if crashed:
+    # Sentinels for the orchestrator -- it greps our journal for these and
+    # reboots us.  Keep the strings in sync with lib/deployer.py.
+    if outcome.crashed:
         print("NIPA DETECTED SYSTEM CRASH, REBOOT ME PLEASE")
+    if outcome.tainted:
+        print("NIPA DETECTED TEST TIMEOUT, REBOOT ME PLEASE")
 
 
 if __name__ == '__main__':

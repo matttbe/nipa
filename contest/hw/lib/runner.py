@@ -4,9 +4,11 @@
 
 import json
 import os
+import re
 import signal
 import subprocess
 import time
+from dataclasses import dataclass
 
 from lib.nipa import has_crash, extract_crash, namify, parse_nested_tests
 
@@ -18,6 +20,25 @@ DEFAULT_TEST_TIMEOUT = 1200
 # How long to wait for a timed-out test to shut down gracefully after the
 # first (SIGINT) signal before we force-kill its whole process tree.
 GRACEFUL_KILL_WAIT = 60
+
+# A test which dies with its *own* uncaught subprocess.TimeoutExpired never
+# runs its cleanup / __exit__, so netns, interfaces, XDP progs, qdiscs and
+# sysctls are left behind and the machine is in an unknown state.  This is not
+# the same as NIPA's own per-test limit firing (see _run_one_test), which is
+# marked with NIPA RUNNER TIMEOUT and is deliberately *not* a trigger.
+#
+# Anchored to the start of a line -- optionally behind kselftest's "# " TAP
+# prefix -- so we match the last line of the traceback and not a test which
+# merely mentions the exception name (e.g. an except clause echoed by set -x).
+TIMEOUT_MARKER = re.compile(r'^#?\s*subprocess\.TimeoutExpired\b', re.M)
+TIMEOUT_WARNING = 'test hit subprocess.TimeoutExpired, machine rebooted'
+
+
+@dataclass
+class RunOutcome:
+    """Result of run_tests()."""
+    crashed: bool = False
+    tainted: bool = False
 
 
 def find_newest_test(tests_dir):
@@ -200,6 +221,24 @@ def _has_real_crash(dmesg_text, filters):
     return True
 
 
+def _hit_timeout(output_dir):
+    """Check a test's saved output for its own subprocess.TimeoutExpired.
+
+    Both streams are checked: kselftest's runner.sh usually folds the test's
+    stderr into the TAP stream, so the traceback normally lands in stdout,
+    but that is kernel-side behaviour we don't control and it varies by
+    target.  A missing file just means "no match".
+    """
+    for name in ('stdout', 'stderr'):
+        try:
+            with open(os.path.join(output_dir, name), encoding='utf-8') as fp:
+                if TIMEOUT_MARKER.search(fp.read()):
+                    return True
+        except OSError:
+            continue
+    return False
+
+
 def _signal_group(pgid, sig):
     """Send a signal to a process group, ignoring it if already gone."""
     try:
@@ -316,12 +355,14 @@ def run_tests(test_dir, results_dir, timeout=DEFAULT_TEST_TIMEOUT):
       6. Drain dmesg output produced during the test, save to dmesg file
       7. Save metadata (retcode, time, target, prog) to info file
 
-    Returns True if a kernel crash was detected, False otherwise.
+    Returns a RunOutcome saying whether a kernel crash was seen and whether
+    a test died with its own subprocess.TimeoutExpired (leaving the machine
+    in an unknown state, so the harness must reboot it).
     """
     tests = _list_tests(test_dir)
     if not tests:
         print("No tests found")
-        return False
+        return RunOutcome()
 
     print(f"Found {len(tests)} tests, per-test timeout {timeout}s")
 
@@ -345,6 +386,7 @@ def run_tests(test_dir, results_dir, timeout=DEFAULT_TEST_TIMEOUT):
     crashed = _has_real_crash(boot_lines, filters) if boot_lines else False
     if crashed:
         print("Kernel crash detected during boot")
+    tainted = False
 
     for test_idx, (target, prog) in enumerate(tests):
         test_name = f"{target}:{prog}"
@@ -376,6 +418,11 @@ def run_tests(test_dir, results_dir, timeout=DEFAULT_TEST_TIMEOUT):
                   encoding='utf-8') as fp:
             stdout = fp.read()
 
+        tainted = _hit_timeout(test_results_dir)
+        if tainted:
+            print(f"[{test_idx+1}/{len(tests)}] {test_name}: "
+                  "test hit subprocess.TimeoutExpired, machine state unknown")
+
         # Drain dmesg produced during this test
         test_dmesg = dmesg.drain()
         crash_fps = set()
@@ -395,9 +442,11 @@ def run_tests(test_dir, results_dir, timeout=DEFAULT_TEST_TIMEOUT):
             if has_crash(test_dmesg):
                 _lines, crash_fps = extract_crash(test_dmesg, '', lambda: filters)
 
-        # Retry if the test failed and no crash
+        # Retry if the test failed and no crash.  A tainted machine makes the
+        # retry worthless (and it may well hang the same way), so skip it --
+        # the harness reboots us and the test stays in .attempted.
         retry_retcode = None
-        if retcode not in (0, 4) and not crashed:
+        if retcode not in (0, 4) and not crashed and not tainted:
             skip_retry, reason = _known_bad_retry_decision(
                 stdout, target, prog, known_bad)
             print(f"[{test_idx+1}/{len(tests)}] {test_name}: {reason}")
@@ -406,6 +455,10 @@ def run_tests(test_dir, results_dir, timeout=DEFAULT_TEST_TIMEOUT):
                 os.makedirs(retry_dir, exist_ok=True)
                 retry_retcode, _retry_elapsed = _run_one_test(
                     test_dir, retry_dir, target, prog, timeout)
+                if _hit_timeout(retry_dir):
+                    tainted = True
+                    print(f"[{test_idx+1}/{len(tests)}] {test_name}: retry hit "
+                          "subprocess.TimeoutExpired, machine state unknown")
                 # Drain retry dmesg
                 retry_dmesg = dmesg.drain()
                 if retry_dmesg:
@@ -428,6 +481,8 @@ def run_tests(test_dir, results_dir, timeout=DEFAULT_TEST_TIMEOUT):
             info['retry_retcode'] = retry_retcode
         if crash_fps:
             info['crashes'] = list(crash_fps)
+        if tainted:
+            info['warnings'] = [TIMEOUT_WARNING]
         with open(os.path.join(test_results_dir, 'info'), 'w', encoding='utf-8') as fp:
             json.dump(info, fp)
             fp.flush()
@@ -435,8 +490,15 @@ def run_tests(test_dir, results_dir, timeout=DEFAULT_TEST_TIMEOUT):
 
         print(f"[{test_idx+1}/{len(tests)}] {test_name}: rc={retcode} ({elapsed}s)")
 
+        # Stop here -- anything we ran now would run on an unknown system.
+        # The harness sees our sentinel, reboots us, and we resume.
+        if tainted:
+            print(f"[{test_idx+1}/{len(tests)}] {test_name}: "
+                  "stopping run, machine needs a reboot")
+            break
+
     dmesg.close()
-    return crashed
+    return RunOutcome(crashed=crashed, tainted=tainted)
 
 
 class DmesgReader:

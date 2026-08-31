@@ -14,9 +14,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from lib.runner import (find_newest_test, load_attempted,
                         mark_attempted, run_tests, DmesgReader,
-                        DEFAULT_TEST_TIMEOUT,
-                        _run_one_test, _known_bad_retry_decision)
+                        DEFAULT_TEST_TIMEOUT, TIMEOUT_WARNING,
+                        _hit_timeout, _run_one_test,
+                        _known_bad_retry_decision)
 from lib.nipa import namify
+
+
+# What a Python kselftest leaves in its output when one of *its* subprocess
+# calls hangs; kselftest's runner.sh prefixes TAP output with "# ".
+TIMEOUT_TRACEBACK = (
+    b'# Traceback (most recent call last):\n'
+    b'#   File "/usr/libexec/kselftests/drivers/net/hw/foo.py", line 12\n'
+    b'#     subprocess.run(["sleep", "60"], timeout=1)\n'
+    b'# subprocess.TimeoutExpired: Command \'[\'sleep\', \'60\']\''
+    b' timed out after 1 seconds\n'
+)
 
 
 def _fake_popen(returncode=0, stdout=b'', stderr=b''):
@@ -66,7 +78,20 @@ class TestFindNewestTest(unittest.TestCase):
         self.assertIsNone(result)
 
 
-class TestKernelVersionCheck(unittest.TestCase):
+class _MainTestCase(unittest.TestCase):
+    """Base for tests which call hw_worker.main().
+
+    main() runs argparse, which would otherwise choke on unittest's own
+    command line ("discover", "-s tests", ...) and SystemExit(2).
+    """
+
+    def setUp(self):
+        patcher = mock.patch('sys.argv', ['hw_worker.py'])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class TestKernelVersionCheck(_MainTestCase):
     @mock.patch('os.uname',
                 return_value=mock.Mock(release='5.15.0-generic'))
     def test_wrong_kernel_exits(self, _mock_uname):
@@ -541,9 +566,173 @@ class TestRunTests(unittest.TestCase):
             os.makedirs(results_dir)
             open(os.path.join(test_dir, 'kselftest-list.txt'), 'w').close()
 
-            run_tests(test_dir, results_dir)
+            outcome = run_tests(test_dir, results_dir)
             # No output dirs should be created
             self.assertEqual(os.listdir(results_dir), [])
+            self.assertFalse(outcome.crashed)
+            self.assertFalse(outcome.tainted)
+
+
+class TestTimeoutTaint(unittest.TestCase):
+    """A test dying with its own subprocess.TimeoutExpired taints the machine.
+
+    NIPA's own per-test limit (NIPA RUNNER TIMEOUT) must NOT trigger this --
+    there the test tree is torn down deliberately, cleanup handlers run, and
+    the retry is still worth doing.
+    """
+
+    def _read_info(self, results_dir, dir_name):
+        with open(os.path.join(results_dir, dir_name, 'info'),
+                  encoding='utf-8') as fp:
+            return json.load(fp)
+
+    def _dirs(self, tmpdir, tests='net:test1.sh\n'):
+        test_dir = os.path.join(tmpdir, 'tests')
+        results_dir = os.path.join(tmpdir, 'results')
+        os.makedirs(test_dir)
+        os.makedirs(results_dir)
+        with open(os.path.join(test_dir, 'kselftest-list.txt'), 'w') as fp:
+            fp.write(tests)
+        return test_dir, results_dir
+
+    @mock.patch('lib.runner.DmesgReader')
+    @mock.patch('subprocess.Popen')
+    def test_nipa_runner_timeout_does_not_taint(self, mock_popen,
+                                                mock_dmesg_cls):
+        """Requirement-1 regression guard -- do not delete this test."""
+        mock_dmesg_cls.return_value.drain.return_value = ''
+        mock_popen.side_effect = [
+            _fake_popen(returncode=1,
+                        stdout=b'not ok 1 test\n'
+                               b'NIPA RUNNER TIMEOUT 600 sec (hard stop)\n',
+                        stderr=b'NIPA RUNNER TIMEOUT 600 sec (hard stop)\n'),
+            _fake_popen(returncode=0, stdout=b'ok 1 retry\n'),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_dir, results_dir = self._dirs(tmpdir)
+
+            outcome = run_tests(test_dir, results_dir)
+
+            self.assertFalse(outcome.tainted)
+            info = self._read_info(results_dir, '0-test1-sh')
+            self.assertNotIn('warnings', info)
+            # The retry must still happen -- this is the whole point.
+            self.assertEqual(mock_popen.call_count, 2)
+            self.assertEqual(info['retry_retcode'], 0)
+
+    @mock.patch('lib.runner.DmesgReader')
+    @mock.patch('subprocess.Popen')
+    def test_timeout_expired_taints_and_stops(self, mock_popen, mock_dmesg_cls):
+        mock_dmesg_cls.return_value.drain.return_value = ''
+        mock_popen.return_value = _fake_popen(
+            returncode=1, stdout=TIMEOUT_TRACEBACK)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_dir, results_dir = self._dirs(
+                tmpdir, 'net:test1.sh\nnet:test2.sh\n')
+
+            outcome = run_tests(test_dir, results_dir)
+
+            self.assertTrue(outcome.tainted)
+            self.assertFalse(outcome.crashed)
+            # The second test must never have been started.
+            self.assertFalse(os.path.exists(
+                os.path.join(results_dir, '1-test2-sh')))
+            self.assertEqual(load_attempted(test_dir), ['net:test1.sh'])
+
+    @mock.patch('lib.runner.DmesgReader')
+    @mock.patch('subprocess.Popen')
+    def test_timeout_expired_skips_retry(self, mock_popen, mock_dmesg_cls):
+        mock_dmesg_cls.return_value.drain.return_value = ''
+        mock_popen.return_value = _fake_popen(
+            returncode=1, stdout=TIMEOUT_TRACEBACK)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_dir, results_dir = self._dirs(tmpdir)
+
+            run_tests(test_dir, results_dir)
+
+            self.assertEqual(mock_popen.call_count, 1)
+            self.assertFalse(os.path.exists(
+                os.path.join(results_dir, '0-test1-sh-retry')))
+            info = self._read_info(results_dir, '0-test1-sh')
+            self.assertNotIn('retry_retcode', info)
+            self.assertEqual(info['warnings'], [TIMEOUT_WARNING])
+
+    @mock.patch('lib.runner.DmesgReader')
+    @mock.patch('subprocess.Popen')
+    def test_timeout_expired_in_stderr_only(self, mock_popen, mock_dmesg_cls):
+        """The traceback normally lands in stdout, but that is up to
+        kselftest's runner.sh -- we must catch it on either stream."""
+        mock_dmesg_cls.return_value.drain.return_value = ''
+        mock_popen.return_value = _fake_popen(
+            returncode=1, stdout=b'not ok 1 test\n', stderr=TIMEOUT_TRACEBACK)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_dir, results_dir = self._dirs(tmpdir)
+
+            outcome = run_tests(test_dir, results_dir)
+
+            self.assertTrue(outcome.tainted)
+            self.assertEqual(mock_popen.call_count, 1)
+
+    @mock.patch('lib.runner.DmesgReader')
+    @mock.patch('subprocess.Popen')
+    def test_timeout_expired_on_retry_taints(self, mock_popen, mock_dmesg_cls):
+        """Run 1 can fail cleanly and the retry be the thing that hangs."""
+        mock_dmesg_cls.return_value.drain.return_value = ''
+        mock_popen.side_effect = [
+            _fake_popen(returncode=1, stdout=b'not ok 1 test\n'),
+            _fake_popen(returncode=1, stdout=TIMEOUT_TRACEBACK),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_dir, results_dir = self._dirs(
+                tmpdir, 'net:test1.sh\nnet:test2.sh\n')
+
+            outcome = run_tests(test_dir, results_dir)
+
+            self.assertTrue(outcome.tainted)
+            self.assertEqual(mock_popen.call_count, 2)
+            info = self._read_info(results_dir, '0-test1-sh')
+            self.assertEqual(info['retry_retcode'], 1)
+            self.assertEqual(info['warnings'], [TIMEOUT_WARNING])
+            self.assertFalse(os.path.exists(
+                os.path.join(results_dir, '1-test2-sh')))
+
+    @mock.patch('lib.runner.DmesgReader')
+    @mock.patch('subprocess.Popen')
+    def test_crash_takes_precedence_over_taint(self, mock_popen,
+                                               mock_dmesg_cls):
+        mock_dmesg_cls.return_value.drain.side_effect = [
+            '',                                  # boot dmesg
+            '[    1.0] Call Trace:\n[    1.1]  bad_func+0x1/0x2\n',
+        ]
+        mock_popen.return_value = _fake_popen(
+            returncode=1, stdout=TIMEOUT_TRACEBACK)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_dir, results_dir = self._dirs(
+                tmpdir, 'net:test1.sh\nnet:test2.sh\n')
+
+            outcome = run_tests(test_dir, results_dir)
+
+            self.assertTrue(outcome.crashed)
+            self.assertTrue(outcome.tainted)
+            # Either way we stop; the harness charges this to the crash budget.
+            self.assertEqual(mock_popen.call_count, 1)
+
+    def test_marker_needs_line_anchor(self):
+        """A test merely naming the exception must not taint the machine."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, 'stdout'), 'w') as fp:
+                fp.write('# caught subprocess.TimeoutExpired, retrying\n')
+            self.assertFalse(_hit_timeout(tmpdir))
+
+            with open(os.path.join(tmpdir, 'stdout'), 'w') as fp:
+                fp.write('# subprocess.TimeoutExpired: Command x timed out\n')
+            self.assertTrue(_hit_timeout(tmpdir))
 
 
 class TestTestTimeoutConfig(unittest.TestCase):
@@ -660,7 +849,7 @@ class TestDmesgReader(unittest.TestCase):
         dmesg.close()  # should not raise
 
 
-class TestMainFlow(unittest.TestCase):
+class TestMainFlow(_MainTestCase):
     def test_no_tests(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             # Empty tests dir
@@ -763,6 +952,41 @@ class TestMainFlow(unittest.TestCase):
             # test1 output dir should NOT exist (it was skipped)
             test1_dir = os.path.join(result_dir, '0-test1-sh')
             self.assertFalse(os.path.isdir(test1_dir))
+
+    @mock.patch('builtins.print')
+    @mock.patch('os.uname')
+    @mock.patch('lib.runner.DmesgReader')
+    @mock.patch('subprocess.Popen')
+    def test_timeout_sentinel_printed(self, mock_popen, mock_dmesg_cls,
+                                      mock_uname, mock_print):
+        """The worker's only channel to the harness is its journal."""
+        mock_uname.return_value = mock.Mock(release='6.12.0')
+        mock_dmesg_cls.return_value.drain.return_value = ''
+        mock_popen.return_value = _fake_popen(
+            returncode=1, stdout=TIMEOUT_TRACEBACK)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tests_dir = os.path.join(tmpdir, 'tests')
+            results_dir = os.path.join(tmpdir, 'results')
+            test_dir = os.path.join(tests_dir, '42')
+            os.makedirs(test_dir)
+            os.makedirs(results_dir)
+
+            with open(os.path.join(test_dir, '.kernel-version'), 'w') as fp:
+                fp.write('6.12.0\n')
+            with open(os.path.join(test_dir, 'kselftest-list.txt'), 'w') as fp:
+                fp.write('net:test1.sh\n')
+
+            from hw_worker import main as hw_main
+            with mock.patch('hw_worker.TESTS_DIR', tests_dir):
+                with mock.patch('hw_worker.RESULTS_DIR', results_dir):
+                    hw_main()
+
+        messages = [str(call.args[0]) for call in mock_print.call_args_list
+                    if call.args]
+        self.assertIn("NIPA DETECTED TEST TIMEOUT, REBOOT ME PLEASE", messages)
+        self.assertNotIn("NIPA DETECTED SYSTEM CRASH, REBOOT ME PLEASE",
+                         messages)
 
 
 if __name__ == '__main__':

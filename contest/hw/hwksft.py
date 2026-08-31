@@ -23,8 +23,7 @@ from lib.deployer import (build_kernel, build_ksft, deploy_artifacts,  # noqa: E
                           parse_results, process_crashes, set_log_file,
                           WaitResult, grab_hw_worker_journal, grab_sol_logs,
                           reboot_machine, check_healthy_ssh,
-                          read_device_info,
-                          CRASH_SENTINEL, _journal_has_crash_sentinel)
+                          read_device_info, journal_reboot_reason)
 
 # Config:
 #
@@ -51,8 +50,12 @@ from lib.deployer import (build_kernel, build_ksft, deploy_artifacts,  # noqa: E
 # machine_control_url=http://control-node:5050
 # reservation_retry_time=60
 # max_kexec_boot_timeout=300
-# max_test_time=3600
+# max_power_cycle_timeout=600
+# max_test_time=3600       (per kexec attempt)
+# max_total_test_time=14400 (across all attempts, incl. reboots)
 # test_timeout=1200        (optional, per-test limit on the DUT)
+# max_crash_retries=2      (reboot-and-resume budget for kernel crashes)
+# max_timeout_reboots=3    (same, for tests hitting subprocess.TimeoutExpired)
 # crash_wait_time=120
 # sol_poll_interval=15
 # disruptive=true          (optional, propagated to test env if set)
@@ -109,6 +112,136 @@ def fetch_known_bad(config):
         known_bad.setdefault(f'{group}/{test_name}', set()).add(subtest)
 
     return {key: sorted(cases) for key, cases in sorted(known_bad.items())}
+
+
+def _run_test_attempts(config, mc, reservation_id, machine_ids, machine_ips,
+                       results_path):
+    """kexec, run, and reboot-and-resume until the machine stops asking.
+
+    hw-worker stops as soon as it detects a kernel crash or a test that died
+    with its own subprocess.TimeoutExpired, and says so via a sentinel in its
+    journal.  Either way the machine is in an unknown state, so we reboot it
+    (SSH first, BMC power cycle as fallback -- see reboot_machine) and kexec
+    back in.  The offending test is already in .attempted, so the worker skips
+    it and carries on with the rest of the suite.
+
+    Crashes and timeouts get separate budgets: a couple of flaky timeouts
+    should not eat the (much stricter) crash budget and silently drop the
+    tail of the suite.
+
+    Returns (WaitResult, warnings) where warnings is a list of strings for
+    the run-level 'warnings' array.
+    """
+    max_crash_retries = config.getint('hw', 'max_crash_retries', fallback=2)
+    max_timeout_reboots = config.getint('hw', 'max_timeout_reboots', fallback=3)
+    max_total_test_time = config.getint('hw', 'max_total_test_time',
+                                        fallback=14400)
+
+    # attempt is monotonic and used *only* for artifact suffixes -- deriving
+    # it from either budget would collide (crash then timeout both give -1)
+    # and silently overwrite the journal/SOL files of the earlier attempt.
+    attempt = 0
+    crash_reboots = 0
+    timeout_reboots = 0
+    warnings = []
+    loop_start = time.monotonic()
+    wait_result = WaitResult(ok=False, error='no test attempt was made')
+
+    while True:
+        attempt_sfx = f'-{attempt}' if attempt else ''
+
+        # Record SOL position before kexec
+        sol_start_ids = {}
+        for mid in machine_ids:
+            sol = mc.get_sol_logs(mid, limit=1, sort='desc')
+            sol_start_ids[mid] = sol.get('last_id', 0)
+
+        # 6. kexec into new kernel
+        kexec_failed = False
+        with open(os.path.join(results_path, f'deploy{attempt_sfx}'), 'a',
+                  encoding='utf-8') as fp:
+            set_log_file(fp)
+            try:
+                kexec_machine(config, machine_ips, reservation_id, mc=mc)
+            except TimeoutError:
+                print("kexec: machine not reachable after kexec, "
+                      "treating as crash")
+                kexec_failed = True
+            set_log_file(None)
+
+        if kexec_failed:
+            wait_result = WaitResult(ok=False,
+                                     error='machine not reachable after kexec',
+                                     needs_power_cycle=True)
+        else:
+            # 7. Wait for hw-worker with crash monitoring
+            remaining = max_total_test_time - (time.monotonic() - loop_start)
+            wait_result = wait_for_results(config, mc, reservation_id,
+                                           machine_ids, machine_ips,
+                                           time_budget=remaining)
+
+        # 8. Grab debug artifacts for this attempt.
+        # If machine is hung (needs_power_cycle), it may still
+        # respond to SSH briefly — try to grab what we can.
+        try:
+            grab_hw_worker_journal(machine_ips[0],
+                                   results_path, suffix=attempt_sfx)
+        except Exception as e:
+            print(f"Warning: failed to grab hw-worker journal: {e}")
+        try:
+            grab_sol_logs(mc, machine_ids, results_path, sol_start_ids,
+                          suffix=attempt_sfx)
+        except Exception as e:
+            print(f"Warning: failed to grab SOL logs: {e}")
+
+        # 9. Does the machine want a reboot, and what for?
+        if wait_result.needs_power_cycle:
+            reason = 'crash'
+        else:
+            try:
+                reason = journal_reboot_reason(machine_ips[0])
+            except Exception:
+                reason = ''
+
+        if not reason:
+            break
+
+        if reason == 'crash':
+            crash_reboots += 1
+            used, budget = crash_reboots, max_crash_retries
+            if wait_result.needs_power_cycle:
+                print(f"Machine hung (attempt {attempt}), rebooting")
+            else:
+                print(f"hw-worker detected crash (attempt {attempt}), rebooting")
+        else:
+            timeout_reboots += 1
+            used, budget = timeout_reboots, max_timeout_reboots
+            print(f"hw-worker hit a test timeout (attempt {attempt}, "
+                  f"timeout reboot {used}/{budget}), rebooting")
+            warnings.append(f'attempt {attempt}: test hit '
+                            'subprocess.TimeoutExpired, machine rebooted')
+
+        # Do the reboot even if we are about to give up, otherwise
+        # if machine is hung we won't be able to fetch results
+        reboot_machine(config, mc, reservation_id, machine_ids, machine_ips)
+
+        if used >= budget:
+            msg = (f'giving up after {used} {reason} reboots, '
+                   'remaining tests were not run')
+            print(msg)
+            if reason == 'timeout':
+                warnings.append(msg)
+            break
+        if time.monotonic() - loop_start > max_total_test_time:
+            msg = ('giving up, total test time budget '
+                   f'({max_total_test_time}s) exhausted')
+            print(msg)
+            warnings.append(msg)
+            break
+
+        attempt += 1
+
+    return wait_result, warnings
 
 
 def test(binfo, rinfo, cbarg):  # pylint: disable=unused-argument
@@ -226,9 +359,7 @@ def test(binfo, rinfo, cbarg):  # pylint: disable=unused-argument
               encoding='utf-8') as fp:
         fp.write(f'{reservation_id}\n')
 
-    max_crash_retries = config.getint('hw', 'max_crash_retries', fallback=2)
     cases = None
-    sol_start_ids = {}
 
     # Load crash filters
     filters = None
@@ -260,74 +391,9 @@ def test(binfo, rinfo, cbarg):  # pylint: disable=unused-argument
                              known_bad=known_bad)
             set_log_file(None)
 
-        for attempt in range(max_crash_retries):
-            attempt_sfx = f'-{attempt}' if attempt > 0 else ''
-
-            # Record SOL position before kexec
-            sol_start_ids = {}
-            for mid in machine_ids:
-                sol = mc.get_sol_logs(mid, limit=1, sort='desc')
-                sol_start_ids[mid] = sol.get('last_id', 0)
-
-            # 6. kexec into new kernel
-            kexec_failed = False
-            with open(os.path.join(results_path, f'deploy{attempt_sfx}'), 'a',
-                      encoding='utf-8') as fp:
-                set_log_file(fp)
-                try:
-                    kexec_machine(config, machine_ips, reservation_id, mc=mc)
-                except TimeoutError:
-                    print(f"kexec: machine not reachable after kexec, "
-                          "treating as crash")
-                    kexec_failed = True
-                set_log_file(None)
-
-            if kexec_failed:
-                wait_result = WaitResult(ok=False,
-                                         error='machine not reachable after kexec',
-                                         needs_power_cycle=True)
-            else:
-                # 7. Wait for hw-worker with crash monitoring
-                wait_result = wait_for_results(config, mc, reservation_id,
-                                               machine_ids, machine_ips)
-
-            # 8. Grab debug artifacts for this attempt.
-            # If machine is hung (needs_power_cycle), it may still
-            # respond to SSH briefly — try to grab what we can.
-            try:
-                grab_hw_worker_journal(machine_ips[0],
-                                       results_path, suffix=attempt_sfx)
-            except Exception as e:
-                print(f"Warning: failed to grab hw-worker journal: {e}")
-            try:
-                grab_sol_logs(mc, machine_ids, results_path, sol_start_ids,
-                              suffix=attempt_sfx)
-            except Exception as e:
-                print(f"Warning: failed to grab SOL logs: {e}")
-
-            # 9. Check if we need to retry
-            needs_retry = wait_result.needs_power_cycle
-            if not needs_retry:
-                try:
-                    needs_retry = _journal_has_crash_sentinel(machine_ips[0])
-                except Exception:
-                    pass
-
-            if not needs_retry:
-                break
-
-            if wait_result.needs_power_cycle:
-                print(f"Machine hung (attempt {attempt+1}), rebooting")
-            else:
-                print(f"hw-worker detected crash (attempt {attempt+1}), rebooting")
-            reboot_machine(config, mc, reservation_id,
-                           machine_ids, machine_ips)
-
-            # Do the reboot even if we are about to give up, otherwise
-            # if machine is hung we won't be able to fetch results
-            if attempt >= max_crash_retries - 1:
-                print(f"Max crash retries ({max_crash_retries}) reached, giving up")
-                break
+        # 6-9. kexec, run, reboot-and-resume until the machine stops asking
+        wait_result, warnings = _run_test_attempts(
+            config, mc, reservation_id, machine_ids, machine_ips, results_path)
 
         # 10. Ensure machine is reachable before fetching results
         if not check_healthy_ssh(machine_ips[0]):
@@ -345,6 +411,18 @@ def test(binfo, rinfo, cbarg):  # pylint: disable=unused-argument
 
         # 12. Parse results
         cases = parse_results(results_path, link)
+
+        # Run-level warnings.  A per-case 'warnings' can be filtered away by
+        # the collector's stability pass (it drops known-unstable cases), and
+        # crashes only dodge that via an explicit force-keep which we do not
+        # want to copy -- it would change what gets reported to patchwork.
+        # The entry-level array is never touched by that pass, so this is what
+        # the status.html summary can rely on.
+        for case in cases:
+            for warn in case.get('warnings', []):
+                warnings.append(f"{case['group']}/{case['test']}: {warn}")
+        if warnings:
+            rinfo['warnings'] = warnings
 
         # 12. Post-process crashes: decode stack traces, extract fingerprints
         try:

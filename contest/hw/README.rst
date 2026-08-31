@@ -321,10 +321,20 @@ Config
  - path to extra kernel config (incl. the driver for the NIC in question)
  - reservation retry time (seconds)
  - max kexec boot timeout (seconds)
- - max test time (seconds)
+ - max power cycle timeout (seconds), how long to wait for the machine to
+   come back after an SSH reboot or a BMC power cycle
+ - max test time (seconds), per kexec attempt
+ - max total test time (seconds), across *all* attempts of a run including
+   the reboots between them; caps how long one run can hold a reservation
  - test timeout (seconds), per-test wall-clock limit enforced by
    ``hw-worker``; passed to the DUT in ``nic-test.env``, defaults to the
    runner's own value when unset
+ - max crash retries, how many times a run may be resumed after a kernel
+   crash before giving up on the remaining tests
+ - max timeout reboots, the same budget for tests which died with their own
+   ``subprocess.TimeoutExpired`` (see `Test timeout recovery`_).  Tracked
+   separately from crash retries so a couple of flaky timeouts cannot eat
+   the crash budget and silently drop the tail of the suite
  - crash wait time (seconds), how long to wait after a crash is detected
    in SOL logs and no new SOL output before power cycling
  - SOL poll interval (seconds), how often to check SOL logs for crashes
@@ -354,6 +364,11 @@ Upon detection of a new testing branch (each step may fail, of course):
 6. Wait for machine to come back, and ``nipa-hw-worker`` service to exit,
    while refreshing the reservation. During this wait hwksft monitors
    SOL logs for kernel crashes (see `Crash recovery`_).
+   When the service exits hwksft checks its journal for a reboot request.
+   ``hw-worker`` asks for one after a kernel crash, and after a test dies
+   with its own ``subprocess.TimeoutExpired`` (see
+   `Test timeout recovery`_).  Either way hwksft reboots the machine and
+   goes back to step 5, so the rest of the suite runs on a clean system.
 7. Copy back the outputs from ``/srv/hw-worker/results/$reservation_id/``
    into appropriate locations in local FS (again, mimicking the ``vmksft-p``
    layout if outputs and json files in separate directories).
@@ -400,6 +415,49 @@ Recovery sequence (after self-reboot or power cycle):
 This cycle can repeat multiple times if different tests cause different
 crashes. Each crash skips only the offending test.
 
+Test timeout recovery
+---------------------
+
+Many ``drivers/net`` selftests are Python and shell out with
+``subprocess.run(..., timeout=N)``.  When one of those inner commands hangs
+the test dies with an uncaught ``subprocess.TimeoutExpired`` traceback, so it
+never runs its cleanup / ``__exit__``: netns, interfaces, XDP programs, qdiscs
+and sysctls are left behind and the machine is in an unknown state.  Anything
+run after that point is suspect.
+
+Note this is *not* the same as ``hw-worker`` hitting its own per-test
+wall-clock limit (``test_timeout``).  There the test tree is torn down
+deliberately -- SIGINT first, so cleanup handlers run -- the output is marked
+``NIPA RUNNER TIMEOUT``, and the retry is still worth doing.  Only the test's
+own traceback triggers the recovery below.
+
+Detection: after each test (and after its retry, if one ran) ``hw-worker``
+scans the saved ``stdout`` and ``stderr`` for a line starting with
+``subprocess.TimeoutExpired``, optionally behind kselftest's ``# `` TAP
+prefix.  Both streams are checked because whether the traceback reaches stdout
+depends on how kselftest's ``runner.sh`` merges them.
+
+Recovery sequence:
+
+1. ``hw-worker`` records ``warnings`` in the test's ``info`` file, skips the
+   test's retry (retrying on a dirty machine is worthless and may hang the
+   same way), stops the run, and prints
+   ``NIPA DETECTED TEST TIMEOUT, REBOOT ME PLEASE`` before exiting.
+   The reboot is always driven by hwksft, never by the DUT itself.
+2. hwksft sees the service exit, greps the journal, and reboots the machine
+   with ``reboot_machine()`` -- SSH ``reboot`` first, falling back to a BMC
+   power cycle only if SSH is unresponsive or the machine does not come back.
+   After a mere test timeout SSH almost always works and is much faster.
+3. hwksft kexecs into the test kernel again and ``hw-worker`` resumes.  The
+   offending test is in ``.attempted``, so it is skipped.
+4. Repeats up to ``max timeout reboots`` times, then hwksft gives up on the
+   remaining tests (it still performs the final reboot).
+
+The timed-out test is reported with its real result -- normally ``fail`` --
+and is *not* retried, so it can never be reported as a flake.  Tests which
+ran before it keep their results; there is no tainting, because the machine
+is rebooted immediately rather than being used for further tests.
+
 State files on the test machine
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -415,8 +473,13 @@ coordinate crash recovery between hwksft and hw-worker:
 ``.attempted``
   JSON list of test names (``target/prog``) already attempted. Written
   with ``fsync`` **before** each test starts. On resume after a crash,
-  tests in this list are skipped and reported as failures. This ensures
-  a crashing test is never retried.
+  tests in this list are skipped. This ensures a crashing test is never
+  retried.
+
+  A test which is in this list but produced no ``info`` file never got to
+  finish -- it is synthesised as a failure with crash info. A test stopped
+  for a *timeout* did write its ``info`` file before ``hw-worker`` exited,
+  so it is reported with its real result plus a ``warnings`` entry.
 
 hw-worker
 =========
@@ -443,11 +506,19 @@ Operation
     d. Capture stdout/stderr, save to ``results_dir/<idx>-<name>/``.
     e. Drain ``/dev/kmsg`` — if any dmesg output was produced during
        the test, save it to ``results_dir/<idx>-<name>/dmesg``.
-    f. Save metadata to ``results_dir/<idx>-<name>/info`` (JSON).
+    f. Scan the saved stdout/stderr for the test's own
+       ``subprocess.TimeoutExpired``. If found, skip the retry, record a
+       ``warnings`` entry and stop the run — the machine needs a reboot
+       (see `Test timeout recovery`_).
+    g. Save metadata to ``results_dir/<idx>-<name>/info`` (JSON).
 5. Results are saved under ``/srv/hw-worker/results/$reservation_id/``.
    hw-worker does **not** determine pass/fail — that is done by hwksft
    when it copies back and parses the output files.
-6. Service exits.
+6. Print a sentinel asking to be rebooted if a kernel crash
+   (``NIPA DETECTED SYSTEM CRASH, REBOOT ME PLEASE``) or a test timeout
+   (``NIPA DETECTED TEST TIMEOUT, REBOOT ME PLEASE``) was seen. This is the
+   only channel hw-worker has to the orchestrator.
+7. Service exits.
 
 Output artifacts
 ----------------
@@ -485,3 +556,17 @@ back and parses it to build the final result JSON.
 
 ``prog``
   Test program name within the collection (e.g. ``rss_drv.py``).
+
+``retry_retcode``
+  Exit code of the retry run, present only if the test was retried.
+
+``crashes``
+  List of crash fingerprints extracted from the test's dmesg, if any.
+
+``warnings``
+  List of strings describing something which went wrong with the *machine*
+  rather than the test, e.g. a test hitting ``subprocess.TimeoutExpired``.
+  Purely informational — it does not change the test's result. hwksft copies
+  this onto the test's result entry and also aggregates all of a run's
+  warnings into a run-level ``warnings`` array, which is what the
+  ``status.html`` summary shows.

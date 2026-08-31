@@ -327,10 +327,15 @@ def grab_sol_logs(mc, machine_ids, results_path, sol_start_ids, suffix=''):
                 cursor = new_cursor
 
 
+# Sentinels hw-worker prints to its journal to ask us to reboot it.
+# Keep in sync with the literals in hw_worker.py (different machines,
+# no shared import).
 CRASH_SENTINEL = "NIPA DETECTED SYSTEM CRASH, REBOOT ME PLEASE"
+TIMEOUT_SENTINEL = "NIPA DETECTED TEST TIMEOUT, REBOOT ME PLEASE"
 
 
-def wait_for_results(config, mc, reservation_id, machine_ids, machine_ips):
+def wait_for_results(config, mc, reservation_id, machine_ids, machine_ips,
+                     time_budget=None):
     """Wait for hw-worker service to exit, monitoring SOL for hard crashes.
 
     Returns WaitResult(ok=True) when service exits cleanly,
@@ -339,8 +344,14 @@ def wait_for_results(config, mc, reservation_id, machine_ids, machine_ips):
     SOL is monitored for crash markers.  If a crash is detected and no
     new SOL output arrives for crash_wait_time seconds, the machine is
     assumed hung and we power-cycle it (this makes the service exit).
+
+    time_budget caps this wait to what is left of the caller's overall
+    budget.  Without it a late attempt could run for a full max_test_time
+    past the point where the caller meant to give up.
     """
     max_test_time = config.getint('hw', 'max_test_time', fallback=3600)
+    if time_budget is not None:
+        max_test_time = min(max_test_time, max(0, time_budget))
     sol_poll_interval = config.getint('hw', 'sol_poll_interval', fallback=15)
     crash_wait_time = config.getint('hw', 'crash_wait_time', fallback=600)
 
@@ -415,12 +426,25 @@ def wait_for_results(config, mc, reservation_id, machine_ids, machine_ips):
         time.sleep(sol_poll_interval)
 
 
-def _journal_has_crash_sentinel(ipaddr):
-    """Check if hw-worker journal contains the crash sentinel."""
+def journal_reboot_reason(ipaddr):
+    """Why hw-worker wants a reboot: 'crash', 'timeout' or '' (no reason).
+
+    Both sentinels can be present at once (a test that timed out *and*
+    splatted the kernel); crash wins, since it is the more severe condition
+    and gets the stricter retry budget.
+
+    'journalctl -b' is scoped to the current boot, and both a reboot and a
+    kexec start a new one, so a sentinel from a previous attempt cannot
+    re-trigger here.
+    """
     journal = _ssh(ipaddr,
                    'journalctl -u nipa-hw-worker.service -b --no-pager',
                    check=False)
-    return CRASH_SENTINEL in journal
+    if CRASH_SENTINEL in journal:
+        return 'crash'
+    if TIMEOUT_SENTINEL in journal:
+        return 'timeout'
+    return ''
 
 
 def check_healthy_ssh(ipaddr):
@@ -590,6 +614,8 @@ def parse_results(results_path, link):
                 outcome['retry'] = retry_result
             if info.get('crashes'):
                 outcome['crashes'] = info['crashes']
+            if info.get('warnings'):
+                outcome['warnings'] = info['warnings']
             if retry_nested:
                 outcome['results'] = retry_nested
             elif nested:

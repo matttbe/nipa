@@ -380,6 +380,31 @@ class TestDeployer(unittest.TestCase):
         self.assertEqual(len(crashed), 1)
         self.assertIn('crash', str(crashed[0]['crashes']))
 
+    def test_parse_results_warnings(self):
+        """A per-test 'warnings' in the info file reaches the case dict."""
+        from lib.deployer import parse_results
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_dir = os.path.join(tmpdir, 'test-outputs', '0-test1-py')
+            os.makedirs(test_dir)
+            with open(os.path.join(test_dir, 'info'), 'w') as fp:
+                json.dump({'retcode': 1, 'time': 1.5,
+                           'target': 'drivers/net', 'prog': 'test1.py',
+                           'warnings': ['test hit subprocess.TimeoutExpired, '
+                                        'machine rebooted']}, fp)
+            with open(os.path.join(test_dir, 'stdout'), 'w') as fp:
+                fp.write('not ok 1 selftests: drivers/net: test1.py\n')
+
+            cases = parse_results(tmpdir, 'http://test/results/123')
+
+        self.assertEqual(len(cases), 1)
+        # The test still just fails -- warnings do not change scoring.
+        self.assertEqual(cases[0]['result'], 'fail')
+        self.assertNotIn('retry', cases[0])
+        self.assertEqual(cases[0]['warnings'],
+                         ['test hit subprocess.TimeoutExpired, '
+                          'machine rebooted'])
+
 
 class TestCrashRecovery(unittest.TestCase):
     def test_crash_detected(self):
@@ -392,15 +417,42 @@ class TestCrashRecovery(unittest.TestCase):
         self.assertTrue(has_crash("] ref_tracker: something"))
         self.assertTrue(has_crash("unreferenced object 0xdead"))
 
-    def test_journal_crash_sentinel(self):
-        """Verify crash sentinel detection in journal."""
+    def _reboot_reason(self, journal):
+        from lib.deployer import journal_reboot_reason
+
+        with mock.patch('lib.deployer._ssh', return_value=journal) as ssh:
+            reason = journal_reboot_reason('10.0.0.1')
+        # Scoped to the current boot, so a sentinel from a previous attempt
+        # (before the reboot/kexec) cannot leak in here.
+        self.assertIn('-b', ssh.call_args.args[1])
+        return reason
+
+    def test_journal_reboot_reason_crash(self):
         from lib.deployer import CRASH_SENTINEL
 
-        journal_with = f"some stuff\n{CRASH_SENTINEL}\nmore stuff"
-        self.assertIn(CRASH_SENTINEL, journal_with)
+        self.assertEqual(
+            self._reboot_reason(f"some stuff\n{CRASH_SENTINEL}\nmore stuff"),
+            'crash')
 
-        journal_without = "some stuff\nCompleted, results in /srv\n"
-        self.assertNotIn(CRASH_SENTINEL, journal_without)
+    def test_journal_reboot_reason_timeout(self):
+        from lib.deployer import TIMEOUT_SENTINEL
+
+        self.assertEqual(
+            self._reboot_reason(f"some stuff\n{TIMEOUT_SENTINEL}\nmore"),
+            'timeout')
+
+    def test_journal_reboot_reason_none(self):
+        self.assertEqual(
+            self._reboot_reason("some stuff\nCompleted, results in /srv\n"),
+            '')
+
+    def test_journal_reboot_reason_crash_wins(self):
+        """A test can both time out and splat the kernel; crash is stricter."""
+        from lib.deployer import CRASH_SENTINEL, TIMEOUT_SENTINEL
+
+        self.assertEqual(
+            self._reboot_reason(f"{TIMEOUT_SENTINEL}\n{CRASH_SENTINEL}\n"),
+            'crash')
 
     @mock.patch('subprocess.run')
     @mock.patch('time.monotonic')
@@ -668,6 +720,122 @@ class TestResolve(unittest.TestCase):
         ]
         with self.assertRaises(RuntimeError):
             resolve_machines(nics, 99)
+
+
+class TestRetryLoop(unittest.TestCase):
+    """_run_test_attempts: reboot-and-resume, and how the budgets are spent.
+
+    hw-worker stopping for a crash and stopping for a test timeout both mean
+    "the machine is in an unknown state, reboot me", but they get separate
+    budgets so a couple of flaky timeouts cannot eat the crash budget and
+    silently drop the tail of the suite.
+    """
+
+    CFG = {'max_crash_retries': 2, 'max_timeout_reboots': 3,
+           'max_total_test_time': 14400}
+
+    def _config(self, **over):
+        values = dict(self.CFG, **over)
+        config = mock.Mock()
+        config.getint.side_effect = \
+            lambda section, key, fallback=None: values.get(key, fallback)
+        return config
+
+    def _run(self, reasons, config=None, wait_result=None):
+        """Drive the loop with a canned sequence of reboot reasons."""
+        import hwksft
+        from lib.deployer import WaitResult
+
+        mc = mock.Mock()
+        mc.get_sol_logs.return_value = {'last_id': 0, 'lines': []}
+
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             mock.patch.object(hwksft, 'kexec_machine'), \
+             mock.patch.object(hwksft, 'wait_for_results',
+                               return_value=wait_result or WaitResult(ok=True)), \
+             mock.patch.object(hwksft, 'grab_hw_worker_journal') as journal, \
+             mock.patch.object(hwksft, 'grab_sol_logs'), \
+             mock.patch.object(hwksft, 'reboot_machine') as reboot, \
+             mock.patch.object(hwksft, 'journal_reboot_reason',
+                               side_effect=reasons):
+            result, warnings = hwksft._run_test_attempts(
+                config or self._config(), mc, 42, [1], ['10.0.0.1'], tmpdir)
+
+        suffixes = [c.kwargs['suffix'] for c in journal.call_args_list]
+        return result, warnings, reboot.call_count, suffixes
+
+    def test_clean_run_no_reboot(self):
+        result, warnings, reboots, suffixes = self._run([''])
+
+        self.assertTrue(result.ok)
+        self.assertEqual(warnings, [])
+        self.assertEqual(reboots, 0)
+        self.assertEqual(suffixes, [''])
+
+    def test_timeout_reboots_do_not_consume_crash_budget(self):
+        # Three timeouts then a crash: the crash budget must be untouched by
+        # the timeouts, so the crash still gets its own two attempts.
+        _r, warnings, reboots, suffixes = self._run(
+            ['timeout', 'timeout', 'crash', ''])
+
+        self.assertEqual(reboots, 3)
+        self.assertEqual(suffixes, ['', '-1', '-2', '-3'])
+        self.assertEqual(len(warnings), 2)
+        self.assertTrue(all('subprocess.TimeoutExpired' in w
+                            for w in warnings))
+
+    def test_timeout_budget_exhausted_still_reboots(self):
+        # Budget is 3; the machine must still be rebooted on the last one,
+        # otherwise we cannot even fetch the results off it.
+        _r, warnings, reboots, suffixes = self._run(
+            ['timeout', 'timeout', 'timeout', 'timeout'])
+
+        self.assertEqual(reboots, 3)
+        self.assertEqual(suffixes, ['', '-1', '-2'])
+        self.assertTrue(any('giving up after 3 timeout reboots' in w
+                            for w in warnings))
+
+    def test_crash_budget_unchanged(self):
+        """Pins the pre-existing behaviour: 2 attempts, 2 reboots."""
+        _r, warnings, reboots, suffixes = self._run(
+            ['crash', 'crash', 'crash'])
+
+        self.assertEqual(reboots, 2)
+        self.assertEqual(suffixes, ['', '-1'])
+        # A crash is not a "warning" -- it is already reported as a crash.
+        self.assertEqual(warnings, [])
+
+    def test_hung_machine_charged_to_crash_budget(self):
+        from lib.deployer import WaitResult
+
+        _r, _w, reboots, suffixes = self._run(
+            ['', '', ''],
+            wait_result=WaitResult(ok=False, error='hung',
+                                   needs_power_cycle=True))
+
+        self.assertEqual(reboots, 2)
+        self.assertEqual(suffixes, ['', '-1'])
+
+    def test_artifact_suffixes_monotonic(self):
+        """Suffixes must not collide across a mixed crash/timeout sequence.
+
+        grab_hw_worker_journal and grab_sol_logs open their files 'w', so a
+        repeated suffix silently destroys the earlier attempt's evidence.
+        Deriving the suffix from either budget counter would make attempt 1
+        (crash_reboots == 1) and attempt 2 (timeout_reboots == 1) collide.
+        """
+        _r, _w, _reboots, suffixes = self._run(
+            ['crash', 'timeout', 'timeout', ''])
+
+        self.assertEqual(suffixes, ['', '-1', '-2', '-3'])
+        self.assertEqual(len(suffixes), len(set(suffixes)))
+
+    def test_total_time_budget_breaks_loop(self):
+        _r, warnings, reboots, _s = self._run(
+            ['timeout'] * 3, config=self._config(max_total_test_time=0))
+
+        self.assertEqual(reboots, 1)
+        self.assertTrue(any('total test time budget' in w for w in warnings))
 
 
 class TestTestCallback(unittest.TestCase):

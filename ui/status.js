@@ -544,6 +544,10 @@ function add_summaries(table, summary, reported)
 	    count_line += " (" + summary["hidden"] + " hidden)";
     }
 
+    if (summary["warn"])
+	count_line += " <span style=\"color: orange\">(" +
+	    summary["warn"] + " warned)</span>";
+
     cell.innerHTML = count_line;
 
     cell = row.insertCell(i++);     // time
@@ -582,6 +586,7 @@ function reset_summary(summary, branch)
     summary["skip"] = 0;
     summary["fail"] = 0;
     summary["pass"] = 0;
+    summary["warn"] = 0;
     summary["hidden"] = 0;
 }
 
@@ -646,6 +651,12 @@ function load_result_table_one(data_raw, table, reported, avgs)
 	var t_start = new Date(v.start);
 	var t_end = new Date(v.end);
 
+	/* A warned run means the machine misbehaved -- e.g. a test died with
+	 * its own subprocess.TimeoutExpired and the harness had to reboot the
+	 * DUT. Worth seeing even if every test which did run passed.
+	 */
+	const warned = v.warnings && v.warnings.length;
+
 	if (v.executor != "brancher") {
 	    summary["total"] += total;
 	    if (total) {
@@ -657,7 +668,9 @@ function load_result_table_one(data_raw, table, reported, avgs)
 	    summary["skip"] += skip;
 	    summary["fail"] += fail;
 	    summary["pass"] += pass;
-	    if (summarize && total && total == pass) {
+	    if (warned)
+		summary["warn"] += 1;
+	    if (summarize && total && total == pass && !warned) {
 		summary["hidden"] += 1;
 		return 1;
 	    }
@@ -670,6 +683,9 @@ function load_result_table_one(data_raw, table, reported, avgs)
 	colorify_str_psf(str_psf, "pass", pass, "green");
 
 	const span_small = " <span style=\"font-size: small;\">(";
+	const span_warn = " <span style=\"font-size: small; color: orange;\">(";
+	if (warned)
+	    str_psf.overall += span_warn + "warn: " + v.warnings.length + ")</span>";
 	if (ignored) {
 	    if (reported)
 		str_psf.overall += span_small + "ignored: " + ignored + ")</span>";

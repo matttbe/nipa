@@ -8,6 +8,7 @@
 import argparse
 import configparser
 import datetime
+import email.utils
 import os
 import signal
 import smtplib
@@ -54,8 +55,19 @@ def load_templates():
     }
 
 
+def tag_addr(addr, tag):
+    """Add a +tag sub-address to the local part of an email address."""
+    if not tag:
+        return addr
+    name, bare = email.utils.parseaddr(addr)
+    local, at, domain = bare.rpartition('@')
+    if not at:
+        return addr
+    return email.utils.formataddr((name, f'{local}+{tag}@{domain}'))
+
+
 def send_email(config, to, subject, body, in_reply_to=None, cc=None,
-               dry_run=False):
+               dry_run=False, tag=None):
     if dry_run:
         return False
 
@@ -64,7 +76,7 @@ def send_email(config, to, subject, body, in_reply_to=None, cc=None,
         port = config.getint('ml-agent-smtp', 'port')
         user = config.get('ml-agent-smtp', 'user')
         password = config.get('ml-agent-smtp', 'password')
-        from_addr = config.get('ml-agent-smtp', 'from')
+        from_addr = tag_addr(config.get('ml-agent-smtp', 'from'), tag)
     except (configparser.NoSectionError, configparser.NoOptionError):
         return False
 
@@ -179,7 +191,7 @@ def process_email(msg, message_id, timestamp, config, db, templates,
             send_email(config, send_to, f'Re: {subject}',
                        templates['resubmit-warn'],
                        in_reply_to=message_id, cc=send_cc,
-                       dry_run=dry_run)
+                       dry_run=dry_run, tag='pv')
             if decisions is not None:
                 decisions.append(('resubmit-warn', email_addr, title))
 
@@ -191,7 +203,7 @@ def process_email(msg, message_id, timestamp, config, db, templates,
                 send_email(config, send_to, f'Re: {subject}',
                            templates['welcome'],
                            in_reply_to=message_id, cc=send_cc,
-                           dry_run=dry_run)
+                           dry_run=dry_run, tag='welcome')
                 if decisions is not None:
                     decisions.append(('welcome', email_addr, title))
             else:
@@ -212,7 +224,7 @@ def process_email(msg, message_id, timestamp, config, db, templates,
             send_email(config, send_to, f'Re: {subject}',
                        templates['threaded-warn'],
                        in_reply_to=message_id, cc=send_cc,
-                       dry_run=dry_run)
+                       dry_run=dry_run, tag='pv')
             if decisions is not None:
                 decisions.append(('threaded-warn', email_addr, title))
         elif decisions is not None:

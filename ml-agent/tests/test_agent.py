@@ -12,7 +12,7 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from db import AgentDB
 from ml_email import parse_email_str
-from agent import process_email, check_known_developer
+from agent import process_email, check_known_developer, tag_addr
 
 
 def _make_raw(subject="[PATCH] test", from_hdr="Dev <dev@example.com>",
@@ -388,6 +388,80 @@ class TestKnownDeveloper(unittest.TestCase):
         iid = self.db.resolve_identity("NoConf", "nc@example.com")
         result = check_known_developer(config_empty, self.db, iid)
         self.assertEqual(result, 0)
+
+
+class TestTagAddr(unittest.TestCase):
+    def test_bare_addr(self):
+        self.assertEqual(tag_addr("bot@example.com", "welcome"),
+                         "bot+welcome@example.com")
+
+    def test_with_display_name(self):
+        self.assertEqual(tag_addr("The Bot <bot@example.com>", "pv"),
+                         "The Bot <bot+pv@example.com>")
+
+    def test_no_tag(self):
+        self.assertEqual(tag_addr("bot@example.com", None),
+                         "bot@example.com")
+
+    def test_malformed_addr(self):
+        self.assertEqual(tag_addr("not-an-address", "pv"), "not-an-address")
+
+
+class TestSendTags(unittest.TestCase):
+    def setUp(self):
+        self.db = AgentDB(":memory:")
+        self.config = configparser.ConfigParser()
+        self.templates = {'welcome': 'Welcome!',
+                          'resubmit-warn': 'Too fast!',
+                          'threaded-warn': 'Not threaded!'}
+
+    def tearDown(self):
+        self.db.close()
+
+    @patch('agent.send_email')
+    @patch('agent.check_known_developer', return_value=2)
+    def test_welcome_tagged(self, mock_known, mock_send):
+        msg = parse_email_str(_make_raw(subject="[PATCH] net: fix foo"))
+        process_email(msg, "<msg@test>", "2026-04-20T10:00:00+00:00",
+                      self.config, self.db, self.templates)
+
+        welcome = [c for c in mock_send.call_args_list
+                   if c[0][3] == 'Welcome!']
+        self.assertEqual(len(welcome), 1)
+        self.assertEqual(welcome[0][1]['tag'], 'welcome')
+
+    @patch('agent.send_email')
+    @patch('agent.check_known_developer', return_value=1)
+    def test_resubmit_warn_tagged(self, mock_known, mock_send):
+        for i, mid in enumerate(["<msg1@test>", "<msg2@test>"]):
+            msg = parse_email_str(_make_raw(subject="[PATCH] net: fix foo",
+                                            message_id=mid))
+            process_email(msg, mid, f"2026-04-20T1{i}:00:00+00:00",
+                          self.config, self.db, self.templates)
+
+        warns = [c for c in mock_send.call_args_list
+                 if c[0][3] == 'Too fast!']
+        self.assertEqual(len(warns), 1)
+        self.assertEqual(warns[0][1]['tag'], 'pv')
+
+    @patch('agent.send_email')
+    @patch('agent.check_known_developer', return_value=1)
+    def test_threaded_warn_tagged(self, mock_known, mock_send):
+        msg = parse_email_str(_make_raw(subject="[PATCH] net: fix foo",
+                                        message_id="<msg1@test>"))
+        process_email(msg, "<msg1@test>", "2026-04-20T10:00:00+00:00",
+                      self.config, self.db, self.templates)
+
+        msg = parse_email_str(_make_raw(subject="[PATCH v2] net: fix foo",
+                                        message_id="<msg2@test>",
+                                        in_reply_to="<msg1@test>"))
+        process_email(msg, "<msg2@test>", "2026-04-22T10:00:00+00:00",
+                      self.config, self.db, self.templates)
+
+        warns = [c for c in mock_send.call_args_list
+                 if c[0][3] == 'Not threaded!']
+        self.assertEqual(len(warns), 1)
+        self.assertEqual(warns[0][1]['tag'], 'pv')
 
 
 if __name__ == '__main__':
